@@ -5,8 +5,17 @@
 ![Metal](https://img.shields.io/badge/GPU-Metal-ff9f0a)
 ![License: MIT](https://img.shields.io/badge/license-MIT-34c759)
 
-This tree is a clean restart from the uploaded prototype.  It intentionally has
-no model-family switch and no fixed transformer layer struct.
+Every mainstream LLM runtime ships a hardcoded transformer: pick a model
+family, get a fixed layer struct. This engine refuses that trade. It reads a
+GGUF container, derives the operation graph from the file's own metadata,
+tensor names, and shapes — then generates the exact Metal kernels the graph
+needs at runtime. No model-family switch. No fixed transformer.
+
+This tree is a clean restart from the uploaded prototype: a multi-GPU Apple
+Silicon runtime core in Objective-C + Metal — a memory-mapped (mmap-backed)
+GGUF loader, a declarative graph compiler, runtime-generated MSL kernels, and
+a bounded-memory tiled executor whose resident footprint stays flat as models
+grow (`resident(W) <= 2 * windowBytes`, independent of tensor size).
 
 The runtime is split into four native Objective-C responsibilities:
 
@@ -37,10 +46,19 @@ make
 Execution is rejected when the file does not contain enough semantic evidence to
 derive a unique graph; the engine does not guess a model family.
 
+Contract tests pin the architecture: `Tests/check_contract.py` asserts all 22
+invariants (mmap-backed model, bounded double windows, runtime MSL generation,
+ambiguity rejection, no hardcoded model-family identifiers, canonical GGML
+type IDs) and `Tests/verify_tile_plan.py` proves every planned tile is bounded
+and covers its tensor exactly.
+
 This clean restart currently ends at graph and GPU-harness compilation. It does
 not falsely expose an interactive generation command before the inferred graph
 executor and tokenizer are connected. The old tree could print `READY`, but it
-could not correctly execute its own claimed memory or model contract.
+could not correctly execute its own claimed memory or model contract — its
+cross-device handoff silently discarded the destination buffer inside a void
+method. The restart returns it explicitly (see `VBSFabric.m`); the failure is
+documented, not hidden.
 
 ## Recovered reference material (2026-09-30)
 
