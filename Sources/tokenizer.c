@@ -171,13 +171,17 @@ static void strmap_init(strmap_t *m, size_t expected) {
 static void strmap_put(strmap_t *m, const char *key, size_t len, int id) {
     uint64_t h = fnv1a(key, len);
     size_t idx = (size_t)(h & (m->cap - 1));
-    while (m->slots[idx].key != NULL) {
+    for (size_t probe = 0; probe < m->cap; probe++) {
+        if (m->slots[idx].key == NULL) break;
         if (m->slots[idx].len == len && memcmp(m->slots[idx].key, key, len) == 0) return;
         idx = (idx + 1) & (m->cap - 1);
     }
-    m->slots[idx].key = (char *)malloc(len + 1);
-    memcpy(m->slots[idx].key, key, len);
-    m->slots[idx].key[len] = 0;
+    if (m->slots[idx].key != NULL) return; /* table full: refuse, never loop forever */
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) return;
+    memcpy(copy, key, len);
+    copy[len] = 0;
+    m->slots[idx].key = copy;
     m->slots[idx].len = len;
     m->slots[idx].id = id;
 }
@@ -206,7 +210,11 @@ static void mergemap_init(mergemap_t *m, size_t expected) {
 static void mergemap_put(mergemap_t *m, uint32_t a, uint32_t b, int rank, uint32_t merged) {
     uint64_t k = ((uint64_t)a << 32) | (uint64_t)b;
     size_t idx = (size_t)((k * 11400714819323198485ULL) & (m->cap - 1));
-    while (m->slots[idx].key != MERGE_EMPTY) idx = (idx + 1) & (m->cap - 1);
+    for (size_t probe = 0; probe < m->cap; probe++) {
+        if (m->slots[idx].key == MERGE_EMPTY) break;
+        idx = (idx + 1) & (m->cap - 1);
+    }
+    if (m->slots[idx].key != MERGE_EMPTY) return; /* table full: refuse, never loop forever */
     m->slots[idx].key = k;
     m->slots[idx].rank = rank;
     m->slots[idx].merged = merged;
@@ -240,6 +248,7 @@ static void vocab_put(tokenizer_t *tok, int id, const char *text, size_t len) {
     if (id < 0 || id >= tok->vocab_cap) return;
     free(tok->vocab[id].text);
     tok->vocab[id].text = (char *)malloc(len + 1);
+    if (!tok->vocab[id].text) return;
     memcpy(tok->vocab[id].text, text, len);
     tok->vocab[id].text[len] = 0;
     tok->vocab[id].len = len;
@@ -279,6 +288,7 @@ static int parse_merges_array(jr_t *r, tokenizer_t *tok) {
             int id_a = strmap_get(&tok->text2id, m, la);
             int id_b = strmap_get(&tok->text2id, sp + 1, lb);
             char *mt = (char *)malloc(la + lb + 1);
+            if (!mt) { free(m); break; }
             memcpy(mt, m, la);
             memcpy(mt + la, sp + 1, lb);
             mt[la + lb] = 0;
@@ -310,11 +320,14 @@ tokenizer_t *tokenizer_load(const char *path) {
     fclose(f);
 
     tokenizer_t *tok = (tokenizer_t *)calloc(1, sizeof(tokenizer_t));
+    if (!tok) { free(buf); return NULL; }
     tok->vocab_cap = 200000;
     tok->vocab = (vocab_entry_t *)calloc((size_t)tok->vocab_cap, sizeof(vocab_entry_t));
+    if (!tok->vocab) { free(buf); free(tok); return NULL; }
     for (int i = 0; i < tok->vocab_cap; i++) tok->vocab[i].byte_value = -1;
     strmap_init(&tok->text2id, (size_t)tok->vocab_cap);
     mergemap_init(&tok->merges, 160000);
+    if (!tok->text2id.slots || !tok->merges.slots) { free(buf); tokenizer_free(tok); return NULL; }
     tok->eos_token_id = -1;
 
     jr_t r = { buf, buf + flen };
@@ -363,7 +376,7 @@ tokenizer_t *tokenizer_load(const char *path) {
     }
 
         int eos = strmap_get(&tok->text2id, "<|endoftext|>", 13);
-    if (eos < 0) eos = strmap_get(&tok->text2id, "<|im_end|>", 11);
+    if (eos < 0) eos = strmap_get(&tok->text2id, "<|im_end|>", 10);
     tok->eos_token_id = eos;
     return tok;
 }
@@ -469,32 +482,42 @@ static void bpe_apply(const tokenizer_t *tok, uint32_t *t, int *n_inout) {
 size_t tokenizer_encode(tokenizer_t *tok, const char *text, uint32_t *out_tokens, size_t max_tokens) {
     if (!tok || !text || !out_tokens || max_tokens == 0) return 0;
     size_t written = 0;
-    uint32_t tmp[8192];
     const char *p = text;
     while (*p && written < max_tokens) {
         size_t seg = segment_len_at(p);
         if (seg == 0) seg = 1;
+        if (seg > (size_t)INT_MAX) return written; /* absurd segment: refuse, never corrupt */
+        /* Segments are unbounded (long whitespace runs); size the scratch
+           buffer to the segment instead of silently dropping bytes past a
+           fixed stack buffer. */
+        uint32_t *tmp = (uint32_t *)malloc(seg * sizeof(uint32_t));
+        if (!tmp) return written;
         int n = 0;
-        for (size_t i = 0; i < seg && p[i] && n < 8192; i++) {
+        for (size_t i = 0; i < seg && p[i]; i++) {
             int tid = tok->byte_to_token[(unsigned char)p[i]];
             tmp[n++] = (tid >= 0) ? (uint32_t)tid : 0;
         }
         if (n >= 2) bpe_apply(tok, tmp, &n);
         for (int i = 0; i < n && written < max_tokens; i++) out_tokens[written++] = tmp[i];
+        free(tmp);
         p += seg;
     }
     return written;
 }
 
 char *tokenizer_decode(tokenizer_t *tok, const uint32_t *tokens, size_t n_tokens) {
-    if (!tok) { char *e = (char *)malloc(1); e[0] = 0; return e; }
+    if (!tok) { char *e = (char *)malloc(1); if (e) e[0] = 0; return e; }
     size_t total = 0;
     for (size_t i = 0; i < n_tokens; i++) {
         uint32_t id = tokens[i];
-        if (id < (uint32_t)tok->vocab_size && tok->vocab[id].text)
-            total += (tok->vocab[id].byte_value >= 0) ? 1 : tok->vocab[id].len;
+        if (id < (uint32_t)tok->vocab_size && tok->vocab[id].text) {
+            size_t add = (tok->vocab[id].byte_value >= 0) ? 1 : tok->vocab[id].len;
+            if (add > SIZE_MAX - total - 1) return NULL;
+            total += add;
+        }
     }
     char *r = (char *)malloc(total + 1);
+    if (!r) return NULL;
     char *o = r;
     for (size_t i = 0; i < n_tokens; i++) {
         uint32_t id = tokens[i];
@@ -525,3 +548,4 @@ void tokenizer_free(tokenizer_t *tok) {
     free(tok->merges.slots);
     free(tok);
 }
+
